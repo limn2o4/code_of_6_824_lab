@@ -54,27 +54,37 @@ func doMapJob(mapf func(string, string) []KeyValue, resp *WorkerResp) error {
 		content, err := ioutil.ReadAll(file)
 		if err != nil {
 			log.Fatalf("cannot read %v", fileName)
+			return err
 		}
 		file.Close()
 		kva := mapf(fileName, string(content))
 		intermediate = append(intermediate, kva...)
 	}
-	outputFile, err := os.Create(resp.Output)
-	if err != nil {
-		log.Fatalf("cannot open %v", resp.Output)
-	}
-	enc := json.NewEncoder(outputFile)
+	outputArr := make([][]KeyValue, resp.NumReduce)
+
 	for _, kv := range intermediate {
-		err := enc.Encode(&kv)
-		if err != nil {
-			log.Fatalf("encode error %v", kv)
-		}
+		partIndex := ihash(kv.Key) % (resp.NumReduce)
+		outputArr[partIndex] = append(outputArr[partIndex], kv)
 	}
-	defer outputFile.Close()
+	for output_idx, partArr := range outputArr {
+		outputFile, err := os.Create(resp.Output[output_idx])
+		if err != nil {
+			log.Fatalf("cannot open %v", resp.Output)
+			return err
+		}
+		enc := json.NewEncoder(outputFile)
+		for _, kv := range partArr {
+			err := enc.Encode(&kv)
+			if err != nil {
+				log.Fatalf("encode error %v", kv)
+			}
+		}
+		outputFile.Close()
+	}
 	return nil
 }
 
-func doReduceJob(reducef func(string, []string) string, resp *WorkerResp) {
+func doReduceJob(reducef func(string, []string) string, resp *WorkerResp) error {
 	kva := make([]KeyValue, 0)
 	for _, filename := range resp.Input {
 		file, err := os.Open(filename)
@@ -96,7 +106,7 @@ func doReduceJob(reducef func(string, []string) string, resp *WorkerResp) {
 	// combine
 	sort.Sort(ByKey(kva))
 	rr, _ := crand.Int(crand.Reader, big.NewInt(1000))
-	oname := fmt.Sprintf("tmp-%s-%d.txt", resp.JobType, rr)
+	oname := fmt.Sprintf("mr-tmp-%s-%d.txt", resp.JobType, rr)
 	ofile, _ := os.Create(oname)
 
 	//
@@ -122,8 +132,10 @@ func doReduceJob(reducef func(string, []string) string, resp *WorkerResp) {
 
 	ofile.Close()
 
-	realname := resp.Output
+	realname := resp.Output[0]
 	os.Rename(oname, realname)
+
+	return nil
 
 }
 func Worker(mapf func(string, string) []KeyValue,
@@ -132,15 +144,29 @@ func Worker(mapf func(string, string) []KeyValue,
 	// Your worker implementation here.
 	WorkerId = int(time.Now().UnixNano())
 	// uncomment to send the Example RPC to the coordinator.
-	for i := 0; i < 20; i += 1 {
+	for {
 		time.Sleep(time.Second)
 		job := getJob()
-
+		var jobStatus = SUCCESS
 		if job.JobType == "map" {
-			doMapJob(mapf, job)
+			err := doMapJob(mapf, job)
+			if err != nil {
+				jobStatus = FAIL
+			}
 		} else if job.JobType == "reduce" {
-			doReduceJob(reducef, job)
+			err := doReduceJob(reducef, job)
+			if err != nil {
+				jobStatus = FAIL
+			}
+		} else if job.JobType == "empty" {
+			continue
+		} else {
+			fmt.Printf("worker %d exit \n", WorkerId)
+			os.Exit(0)
 		}
+
+		reportDone(job.JobId, jobStatus)
+
 	}
 
 }
@@ -152,6 +178,16 @@ func getJob() *WorkerResp {
 	call("Coordinator.GetJob", &args, &resp)
 
 	fmt.Printf("worker get %+v\n", resp)
+
+	return &resp
+}
+
+func reportDone(jobId string, jobStatus int) *WorkerReportResp {
+	args := WorkerReportReq{WorkerId: fmt.Sprintf("%d", WorkerId), JobId: jobId, JobStatus: jobStatus}
+
+	resp := WorkerReportResp{}
+
+	call("Coordinator.reportJob", &args, &resp)
 
 	return &resp
 }

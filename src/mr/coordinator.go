@@ -16,7 +16,7 @@ type Job struct {
 	partition int
 	numReduce int
 	input     []string
-	output    string
+	output    []string
 	Status    int //init 0,run 1,success 2,fail 3
 }
 
@@ -112,6 +112,7 @@ func (c *Coordinator) GetJob(req *WorkerReq, resp *WorkerResp) error {
 	fmt.Println("call GetJob")
 	job := c.jobQueue.pop()
 	if job == nil {
+		resp.JobType = "empty"
 		return fmt.Errorf("no job avaliable")
 	}
 	resp.JobId = job.jobId
@@ -123,6 +124,13 @@ func (c *Coordinator) GetJob(req *WorkerReq, resp *WorkerResp) error {
 	c.jobStatus.setStatus(job.jobId, RUNNING)
 	fmt.Printf("assigned job %s to worker %s\n", job.jobId, req.WorkerId)
 
+	return nil
+}
+
+func (c *Coordinator) ReportJob(req *WorkerReportReq, resp *WorkerReportResp) error {
+	c.jobStatus.lock.Lock()
+	c.jobStatus.Status[req.JobId] = req.JobStatus
+	c.jobStatus.lock.Unlock()
 	return nil
 }
 
@@ -144,17 +152,25 @@ func (c *Coordinator) server() {
 }
 
 func (c *Coordinator) makeJobs(files []string, nReduce int) int {
-	input_list := make([]string, 0)
+
 	c.jobStatus.Status = make(map[string]int)
 	c.jobStatus.Cnt = make(map[string]int)
 	c.jobInfo = make(map[string]*Job)
 
+	reduceInputsList := make([][]string, nReduce)
+
 	for idx, file := range files {
 		jobId := fmt.Sprintf("map_job_%d", idx)
 		input_file := file
-		output_file := fmt.Sprintf("mr-map-res-%s.txt", jobId)
-		input_list = append(input_list, output_file)
-		jobInst := Job{jobId: jobId, jobType: "map", input: []string{input_file}, output: output_file}
+
+		output_list := make([]string, 0)
+		for idx := 0; idx < nReduce; idx += 1 {
+			output_file := fmt.Sprintf("mr-map-res-%s-%d.txt", jobId, idx)
+			output_list = append(output_list, output_file)
+			reduceInputsList[idx] = append(reduceInputsList[idx], output_file)
+		}
+
+		jobInst := Job{jobId: jobId, jobType: "map", input: []string{input_file}, output: output_list}
 		c.jobQueue.push(&jobInst)
 		c.jobInfo[jobId] = &jobInst
 		c.jobStatus.Status[jobId] = INIT
@@ -163,7 +179,8 @@ func (c *Coordinator) makeJobs(files []string, nReduce int) int {
 	for i := 0; i < nReduce; i += 1 {
 		jobId := fmt.Sprintf("reduce_job_%d", i)
 		output_file := fmt.Sprintf("mr-out-%d.txt", i)
-		jobInst := Job{jobId: jobId, jobType: "reduce", input: input_list, output: output_file, partition: i, numReduce: nReduce}
+		output_list := append(make([]string, 0), output_file)
+		jobInst := Job{jobId: jobId, jobType: "reduce", input: reduceInputsList[i], output: output_list, partition: i, numReduce: nReduce}
 		c.jobQueue.push(&jobInst)
 		c.jobInfo[jobId] = &jobInst
 		c.jobStatus.Status[jobId] = INIT
@@ -193,24 +210,14 @@ func (c *Coordinator) Done() bool {
 	// Your code here.
 	complete_job := 0
 	for jobId, item := range c.jobInfo {
-
-		_, err := os.Stat(item.output)
-		is_job_finish := false
-		if err == nil {
-			if !os.IsExist(err) {
-				is_job_finish = true
-			} else {
-				is_job_finish = false
-			}
-		}
 		// fmt.Printf("jobid %s status : %d is_finish %v \n", item.jobId, c.jobStatus.Status[item.jobId], is_job_finish)
 		curStatus := c.jobStatus.getStatus(jobId)
-		if is_job_finish {
+		if curStatus == SUCCESS {
 			complete_job += 1
 			c.jobStatus.lock.Lock()
 			c.jobStatus.Status[jobId] = SUCCESS
 			c.jobStatus.lock.Unlock()
-		} else if curStatus == RUNNING {
+		} else if curStatus == FAIL {
 			c.jobStatus.lock.Lock()
 			if c.jobStatus.Cnt[jobId] < 10 {
 				c.jobStatus.Cnt[jobId] += 1

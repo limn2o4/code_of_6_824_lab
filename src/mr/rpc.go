@@ -34,7 +34,17 @@ type WorkerResp struct {
 	Partition int      `json:"partition"`
 	NumReduce int      `json:"numReduce"`
 	Input     []string `json:"input"`
-	Output    string   `json:"output"`
+	Output    []string `json:"output"`
+}
+
+type WorkerReportReq struct {
+	WorkerId  string
+	JobId     string
+	JobStatus int
+}
+
+type WorkerReportResp struct {
+	WorkerId string
 }
 
 // Add your RPC definitions here.
