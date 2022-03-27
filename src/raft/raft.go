@@ -18,14 +18,15 @@ package raft
 //
 
 import (
-//	"bytes"
+	//	"bytes"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
-//	"6.824/labgob"
+	//	"6.824/labgob"
 	"6.824/labrpc"
 )
-
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -50,6 +51,16 @@ type ApplyMsg struct {
 	SnapshotIndex int
 }
 
+const (
+	FOLLOWER  int = 0
+	CANDIDATE     = 1
+	LEADER        = 2
+)
+
+type Log struct {
+	logId int32
+}
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -63,7 +74,19 @@ type Raft struct {
 	// Your data here (2A, 2B, 2C).
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
+	currentStatus     int   //server status
+	isLeader          bool  //when true,means current server is leader
+	lastHeartBeatTime int32 //time stamp when recive heart beat from leader
 
+	currentTerm int
+	votedFor    int
+	log         []Log
+
+	commitIndex    int32
+	lastAppliedIdx int32
+
+	nextIndex  []int32
+	matchIndex []int32
 }
 
 // return currentTerm and whether this server
@@ -73,6 +96,10 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term = rf.currentTerm
+	isleader = rf.isLeader
 	return term, isleader
 }
 
@@ -91,7 +118,6 @@ func (rf *Raft) persist() {
 	// data := w.Bytes()
 	// rf.persister.SaveRaftState(data)
 }
-
 
 //
 // restore previously persisted state.
@@ -115,7 +141,6 @@ func (rf *Raft) readPersist(data []byte) {
 	// }
 }
 
-
 //
 // A service wants to switch to snapshot.  Only do so if Raft hasn't
 // have more recent info since it communicate the snapshot on applyCh.
@@ -136,13 +161,16 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 
 }
 
-
 //
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
+	Term         int32
+	VandidateId  int32
+	LastLogIndex int32
+	LastLogTerm  int32
 }
 
 //
@@ -151,6 +179,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
+	Term        int32
+	VoteGranted bool
 }
 
 //
@@ -194,6 +224,60 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+type AppendEntriesReq struct {
+	Term         int
+	LeaderId     int32
+	PrevLogIndex int32
+	PrevLogTerm  int32
+	Entries      []Log
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+//request only send by leader
+
+func (rf *Raft) sendAppendEntries(server int, req *AppendEntriesReq, resp *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", req, resp)
+	return ok
+}
+func (rf *Raft) sendHeatBeat() bool {
+	if rf.currentStatus != LEADER {
+		return false
+	}
+	for _, cli := range rf.peers {
+		req := &AppendEntriesReq{}
+		req.Term = rf.currentTerm
+		req.Entries = make([]Log, 0)
+
+		resp := &AppendEntriesReply{}
+		go func(curCli *labrpc.ClientEnd) {
+			curCli.Call("Raft.AppendEntries", req, resp)
+			if !resp.Success {
+				log.Println("call heat beat failed")
+			}
+		}(cli)
+	}
+	return true
+}
+func (rf *Raft) AppendEntries(req *AppendEntriesReq, resp *AppendEntriesReply) bool {
+	resp.Term = rf.currentTerm
+	resp.Success = true
+	if req.Term < rf.currentTerm {
+		resp.Success = false
+		return true
+	}
+	if len(req.Entries) > 0 {
+		// do nonthing
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	rf.lastHeartBeatTime = int32(time.Now().Unix())
+	return true
+}
 
 //
 // the service using Raft (e.g. a k/v server) wants to start
@@ -215,7 +299,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
 
 	return index, term, isLeader
 }
@@ -249,8 +332,16 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-
 	}
+}
+func (rf *Raft) handleFollower() {
+
+}
+func (rf *Raft) handelLeader() {
+	rf.sendHeatBeat()
+}
+func (rf *Raft) handelCandidate() {
+
 }
 
 //
@@ -278,7 +369,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
-
 
 	return rf
 }
