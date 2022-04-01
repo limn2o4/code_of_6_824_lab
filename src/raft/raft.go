@@ -59,9 +59,13 @@ const (
 )
 
 type Log struct {
-	logId int32
+	LogId int32
 }
 
+const (
+	ELECTION_VOTE_CNT_INTERVERL_MS = 50
+	HEARTS_BEAT_INTERVEL_MS = 
+)
 //
 // A Go object implementing a single Raft peer.
 //
@@ -78,8 +82,8 @@ type Raft struct {
 	currentStatus int //server status
 	currentTerm   int
 
-	lastHeartBeatTime int32 //time stamp when recive heart beat from leader
-	electionTimeout   int32 //time elapse define how long a server will start election without reciving heart beat
+	lastHeartBeatTime int64 //time stamp when recive heart beat from leader
+	electionTimeout   int64 //time elapse define how long a server will start election without reciving heart beat
 
 	votedFor int
 	log      []Log
@@ -220,6 +224,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 	}
 	rf.mu.Unlock()
+	log.Printf("raft %d recive vote from %d granted %v", rf.me, args.CandidateId, reply.VoteGranted)
 	return
 }
 
@@ -283,38 +288,44 @@ func (rf *Raft) sendHeatBeat() bool {
 	if !isleader {
 		return false
 	}
-	for _, cli := range rf.peers {
+	// log.Printf("leader %d send hb", rf.me)
+	for rf_id, _ := range rf.peers {
+		if rf_id == rf.me {
+			continue
+		}
 		req := &AppendEntriesReq{}
 		req.Term = curTerm
 		req.Entries = make([]Log, 0)
 
 		resp := &AppendEntriesReply{}
-		go func(curCli *labrpc.ClientEnd) {
-			curCli.Call("Raft.AppendEntries", req, resp)
+		go func(curId int) {
+			rf.sendAppendEntries(curId, req, resp)
 			if !resp.Success {
-				log.Println("call heat beat failed")
+				// log.Println("call heat beat failed")
 				//TODO handle haerted failure
 			}
-		}(cli)
+		}(rf_id)
 	}
 	return true
 }
 
 //handel hb in lab 2a
-func (rf *Raft) AppendEntries(req *AppendEntriesReq, resp *AppendEntriesReply) bool {
+func (rf *Raft) AppendEntries(req *AppendEntriesReq, resp *AppendEntriesReply) {
 	curTerm, _ := rf.GetState()
 	resp.Success = true
 	if req.Term < curTerm {
 		//reject from outdate request
+		log.Printf("raft %d reject hb from %d this term = %v req term %v", rf.me, req.LeaderId, curTerm, req.Term)
 		resp.Term = curTerm
 		resp.Success = false
-		return true
+		return
 	}
 	if len(req.Entries) == 0 {
 		// heart beats request
+		log.Printf("raft %d recive hb from %d", rf.me, req.LeaderId)
 		rf.mu.Lock()
-		rf.currentTerm = req.Term                       //update term
-		rf.lastHeartBeatTime = int32(time.Now().Unix()) // update heart beat ts
+		rf.currentTerm = req.Term             //update term
+		rf.lastHeartBeatTime = GetTimeNowMs() // update heart beat ts
 
 		//reset
 		rf.currentStatus = FOLLOWER
@@ -322,7 +333,7 @@ func (rf *Raft) AppendEntries(req *AppendEntriesReq, resp *AppendEntriesReply) b
 		rf.votedFor = -1
 		rf.mu.Unlock()
 	}
-	return true
+	return
 }
 
 //
@@ -370,8 +381,11 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
-func GetTimeOut() int32 {
-	return int32((rand.Intn(2000)+1000)%3000) * 1000 * 1000
+func GetTimeOut() int64 {
+	return int64((rand.Intn(150) + 150) % 451)
+}
+func GetTimeNowMs() int64 {
+	return int64(time.Now().UnixNano()) / int64(time.Millisecond)
 }
 
 // The ticker go routine starts a new election if this peer hasn't received
@@ -382,22 +396,22 @@ func (rf *Raft) ticker() {
 		// Your code here to check if a leader election should
 		// be started and to randomize sleeping time using
 		// time.Sleep().
-		var timeout int32 = GetTimeOut()
+		var timeout int64 = GetTimeOut()
 		rf.mu.Lock()
 		timeout = rf.electionTimeout
 		rf.mu.Unlock()
 		//do sleep
+		time.Sleep(time.Duration(timeout) * time.Millisecond)
 
-		time.Sleep(time.Duration(timeout))
-
-		curTime := int32(time.Now().Unix())
+		curTime := GetTimeNowMs()
 		rf.mu.Lock()
 		lastTime := rf.lastHeartBeatTime
 		timeout = rf.electionTimeout
 		curStat := rf.currentStatus
 		rf.mu.Unlock()
-		log.Printf("%d - %d < %d\n", curTime, lastTime, timeout)
+		log.Printf("raft %d status check %v after %v timeout %v \n", rf.me, curStat, curTime-lastTime, timeout)
 		if curStat != LEADER && curTime-lastTime >= timeout {
+			log.Printf("raft %d start election !", rf.me)
 			rf.handelElection()
 		}
 
@@ -421,49 +435,60 @@ func (rf *Raft) handelElection() bool {
 	rf.currentTerm += 1
 	rf.votedFor = rf.me
 	newTerm := rf.currentTerm
-	rf.lastHeartBeatTime = int32(time.Now().Unix())
+	rf.lastHeartBeatTime = GetTimeNowMs()
 	rf.mu.Unlock()
 	// 2. send vote request
-	var voteCnt int32 = 0
-	for _, cli := range rf.peers {
+	var voteCnt int32 = 1
+	for rf_id, cli := range rf.peers {
+		if rf_id == rf.me {
+			continue
+		}
 		req := &RequestVoteArgs{}
 		resp := &RequestVoteReply{}
 		req.Term = newTerm
+		req.CandidateId = rf.me
 
-		go func(curCli *labrpc.ClientEnd) {
+		go func(curCli *labrpc.ClientEnd, id int) {
 			curCli.Call("Raft.RequestVote", req, resp)
 			if !resp.VoteGranted {
-				log.Println("vote not granted!")
+				log.Printf("vote not granted from %d to %d !\n", req.CandidateId, id)
 				//TODO handle haerted failure
 			} else {
 				atomic.AddInt32(&voteCnt, int32(1))
 
 			}
-		}(cli)
+		}(cli, rf_id)
 	}
 	total_peers := len(rf.peers)
 	//3. cnt vote
 	for rf.killed() == false {
 		//vote cnt process
-		time.Sleep(time.Millisecond * 50)
+		time.Sleep(time.Millisecond * 10)
 		//check current state
 		rf.mu.Lock()
 		now_state := rf.currentStatus
 		rf.mu.Unlock()
 		if now_state != CANDIDATE {
 			// some other raft win election
+			log.Printf("some raft win election term %d", rf.currentTerm)
 			return true
 		}
 		vote_now := int(atomic.LoadInt32(&voteCnt))
-		nowTime := int32(time.Now().Unix())
-		log.Printf("candidate %d cnt vote : %d/%d\n using %d before %d", rf.me, vote_now, total_peers, (nowTime - rf.lastHeartBeatTime), rf.electionTimeout)
-		if vote_now > total_peers/2+(total_peers%2) {
+		nowTime := GetTimeNowMs()
+		log.Printf("candidate %d cnt vote : %d/%d using %d before %d", rf.me, vote_now, total_peers, (nowTime - rf.lastHeartBeatTime), rf.electionTimeout)
+		if vote_now > total_peers/2+((total_peers%2)^1) {
 			// win election
+			log.Printf("raft %d win election term %d", rf.me, rf.currentTerm)
 			rf.mu.Lock()
 			rf.currentStatus = LEADER
 			rf.mu.Unlock()
 			return true
 		} else if nowTime-rf.lastHeartBeatTime >= rf.electionTimeout {
+			log.Printf("raft %d with term %d election timeout %d", rf.me, rf.currentTerm, rf.electionTimeout)
+			//reset
+			rf.mu.Lock()
+			rf.votedFor = -1
+			rf.mu.Unlock()
 			return false
 		}
 	}
