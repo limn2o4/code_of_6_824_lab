@@ -20,6 +20,7 @@ package raft
 import (
 	//	"bytes"
 	"log"
+	"math"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -60,12 +61,15 @@ const (
 
 type Log struct {
 	LogId int32
+	Term  int
+	Cmd   interface{}
 }
 
 const (
 	ELECTION_VOTE_CNT_INTERVERL_MS = 50
-	HEARTS_BEAT_INTERVEL_MS = 
+	HEARTS_BEAT_INTERVEL_MS        = 100
 )
+
 //
 // A Go object implementing a single Raft peer.
 //
@@ -88,11 +92,13 @@ type Raft struct {
 	votedFor int
 	log      []Log
 
+	appendCh       chan *Log
 	commitIndex    int32
 	lastAppliedIdx int32
+	applyCh        chan ApplyMsg
 
-	nextIndex  []int32
-	matchIndex []int32
+	nextIndex  []int
+	matchIndex []int
 }
 
 // return currentTerm and whether this server
@@ -214,17 +220,27 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = false
 		return
 	}
+
 	rf.mu.Lock()
 	nowVoteFor := rf.votedFor
+	nowLastLogIdx := rf.lastAppliedIdx
+	nowLastLogTerm := rf.log[rf.lastAppliedIdx].Term
+	//If the logs have last entries with different terms, then
+	// the log with the later term is more up-to-date. If the logs
+	// end with the same term, then whichever log is longer is
+	// more up-to-date.
 
-	if nowVoteFor == -1 || nowVoteFor == args.CandidateId {
+	if (nowVoteFor == -1 || nowVoteFor == args.CandidateId) &&
+		(int32(nowLastLogTerm) < args.LastLogTerm ||
+			(nowLastLogTerm == int(args.LastLogTerm) && int(nowLastLogIdx) <= int(args.LastLogIndex))) {
 		reply.Term = nowTerm
 		reply.VoteGranted = true
 		// granted vote
+		rf.currentStatus = CANDIDATE
 		rf.votedFor = args.CandidateId
 	}
 	rf.mu.Unlock()
-	log.Printf("raft %d recive vote from %d granted %v", rf.me, args.CandidateId, reply.VoteGranted)
+	log.Printf("raft %d recive vote from %d granted %v nowVoteFor %d nowLastLogIdx %d nowLastLogTerm %d args: %+v", rf.me, args.CandidateId, reply.VoteGranted, nowVoteFor, nowLastLogIdx, nowLastLogTerm, args)
 	return
 }
 
@@ -268,7 +284,7 @@ type AppendEntriesReq struct {
 	PrevLogIndex int32
 	PrevLogTerm  int32
 	Entries      []Log
-	LeaderCommit int
+	LeaderCommit int32
 }
 
 type AppendEntriesReply struct {
@@ -284,18 +300,31 @@ func (rf *Raft) sendAppendEntries(server int, req *AppendEntriesReq, resp *Appen
 }
 
 func (rf *Raft) sendHeatBeat() bool {
-	curTerm, isleader := rf.GetState()
+
+	rf.mu.Lock()
+	curTerm := rf.currentTerm
+	isleader := rf.currentStatus == LEADER
+	curCommitIdx := rf.commitIndex
+	rf.mu.Unlock()
 	if !isleader {
 		return false
 	}
 	// log.Printf("leader %d send hb", rf.me)
-	for rf_id, _ := range rf.peers {
-		if rf_id == rf.me {
+	for rId, _ := range rf.peers {
+		if rId == rf.me {
 			continue
 		}
 		req := &AppendEntriesReq{}
 		req.Term = curTerm
+		req.LeaderCommit = curCommitIdx
 		req.Entries = make([]Log, 0)
+
+		//catch up
+		rf.mu.Lock()
+		req.Entries = append(req.Entries, rf.log[rf.nextIndex[rId]:]...)
+		req.PrevLogIndex = int32(rf.nextIndex[rId] - 1)
+		req.PrevLogTerm = int32(rf.log[req.PrevLogIndex].Term)
+		rf.mu.Unlock()
 
 		resp := &AppendEntriesReply{}
 		go func(curId int) {
@@ -303,36 +332,103 @@ func (rf *Raft) sendHeatBeat() bool {
 			if !resp.Success {
 				// log.Println("call heat beat failed")
 				//TODO handle haerted failure
+
+				curTerm, _ := rf.GetState()
+				if curTerm < resp.Term {
+					//turn to follower
+					log.Printf("raft %d turn to follower", rf.me)
+					rf.mu.Lock()
+					rf.currentStatus = FOLLOWER
+					rf.electionTimeout = GetTimeOut()
+					rf.votedFor = -1
+					rf.mu.Unlock()
+				}
+				// update nextIndex
+				rf.mu.Lock()
+				lastTerm := rf.log[rf.nextIndex[curId]-1].Term
+				for nxtIdx := rf.nextIndex[curId] - 1; nxtIdx >= 0; nxtIdx-- {
+					if iterLog := rf.log[nxtIdx]; iterLog.Term < lastTerm {
+						rf.nextIndex[curId] = nxtIdx + 1
+						break
+					}
+				}
+				rf.mu.Unlock()
+				log.Printf("leader %d nextIndex retrive result : %+v", rf.me, rf.nextIndex)
+
+			} else {
+				if len(req.Entries) > 0 {
+					rf.mu.Lock()
+					rf.matchIndex[curId] = int(math.Max(float64(rf.matchIndex[curId]), float64(req.Entries[len(req.Entries)-1].LogId)))
+					rf.mu.Unlock()
+
+				}
 			}
-		}(rf_id)
+
+		}(rId)
 	}
 	return true
+}
+func (rf *Raft) SendLogToApplyCh(lastLog *Log) {
+	applyMsg := ApplyMsg{}
+	applyMsg.CommandValid = true
+	applyMsg.CommandIndex = int(lastLog.LogId)
+	applyMsg.Command = lastLog.Cmd
+	rf.applyCh <- applyMsg
+	log.Printf("raft %d commit to applyCh %+v", rf.me, lastLog)
+	return
 }
 
 //handel hb in lab 2a
 func (rf *Raft) AppendEntries(req *AppendEntriesReq, resp *AppendEntriesReply) {
 	curTerm, _ := rf.GetState()
-	resp.Success = true
+	resp.Term = curTerm
+	resp.Success = false
 	if req.Term < curTerm {
 		//reject from outdate request
-		log.Printf("raft %d reject hb from %d this term = %v req term %v", rf.me, req.LeaderId, curTerm, req.Term)
-		resp.Term = curTerm
-		resp.Success = false
+		log.Printf("raft %d reject append from %d this term = %v req term %v", rf.me, req.LeaderId, curTerm, req.Term)
 		return
 	}
-	if len(req.Entries) == 0 {
-		// heart beats request
-		log.Printf("raft %d recive hb from %d", rf.me, req.LeaderId)
-		rf.mu.Lock()
-		rf.currentTerm = req.Term             //update term
-		rf.lastHeartBeatTime = GetTimeNowMs() // update heart beat ts
 
-		//reset
+	rf.mu.Lock()
+	rf.currentTerm = req.Term //update term
+	resp.Term = req.Term
+	rf.lastHeartBeatTime = GetTimeNowMs() // update heart beat ts
+	curCommitIdx := rf.commitIndex
+	//reset
+	if rf.currentStatus != FOLLOWER {
 		rf.currentStatus = FOLLOWER
 		rf.electionTimeout = GetTimeOut()
 		rf.votedFor = -1
-		rf.mu.Unlock()
 	}
+	rf.mu.Unlock()
+	log.Printf("raft %d status %d votefor %d get append req: %+v", rf.me, rf.currentStatus, rf.votedFor, req)
+	for i, nowLog := range rf.log {
+		if nowLog.LogId == req.PrevLogIndex && nowLog.Term == int(req.PrevLogTerm) {
+			rf.mu.Lock()
+			rf.log = append(rf.log[:i+1], req.Entries...)
+			rf.lastAppliedIdx = rf.log[len(rf.log)-1].LogId
+
+			if req.LeaderCommit > curCommitIdx {
+				//
+				rf.commitIndex = int32(math.Min(float64(req.LeaderCommit), float64(rf.lastAppliedIdx)))
+				log.Printf("raft %d update commit from %d to %d", rf.me, curCommitIdx, rf.commitIndex)
+
+			}
+			go func(sendLogs []Log) {
+
+				for _, sendLog := range sendLogs {
+					rf.SendLogToApplyCh(&sendLog)
+				}
+			}(rf.log[curCommitIdx+1 : rf.commitIndex+1])
+
+			rf.mu.Unlock()
+			resp.Success = true
+			log.Printf("raft %d accept log entries : %+v", rf.me, rf.log)
+			return
+		}
+	}
+	log.Printf("raft %d reject log ! cur logs : %+v ", rf.me, rf.log)
+
 	return
 }
 
@@ -356,8 +452,53 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := true
 
 	// Your code here (2B).
-
+	term, isLeader = rf.GetState()
+	if isLeader {
+		rf.mu.Lock()
+		newLogId := len(rf.log)
+		newLog := Log{int32(newLogId), term, command}
+		rf.log = append(rf.log, newLog)
+		rf.lastAppliedIdx = newLog.LogId
+		//send AppendEntreis
+		rf.mu.Unlock()
+		go rf.brodcastNewLog([]Log{newLog})
+		index = newLogId
+	}
 	return index, term, isLeader
+}
+
+func (rf *Raft) brodcastNewLog(inputLog []Log) {
+	rf.mu.Lock()
+	curTerm := rf.currentTerm
+	curCommitIdx := rf.commitIndex
+	rf.mu.Unlock()
+	for rId, cli := range rf.peers {
+		if rId == rf.me {
+			continue
+		}
+		req := &AppendEntriesReq{}
+
+		req.Term = curTerm
+		req.Entries = append(make([]Log, 0), inputLog...)
+
+		req.PrevLogIndex = inputLog[0].LogId - 1
+		req.PrevLogTerm = int32(rf.log[req.PrevLogIndex].Term)
+		req.LeaderCommit = curCommitIdx
+
+		resp := &AppendEntriesReply{}
+		go func(id int, cli *labrpc.ClientEnd) {
+			cli.Call("Raft.AppendEntries", req, resp)
+			if resp.Success {
+				rf.mu.Lock()
+				lastLog := inputLog[len(inputLog)-1]
+				rf.nextIndex[id] = int(math.Max(float64(rf.nextIndex[id]), float64(lastLog.LogId)+1))
+				rf.matchIndex[id] = int(math.Max(float64(rf.matchIndex[id]), float64(lastLog.LogId)))
+				rf.mu.Unlock()
+				log.Printf("leader %d send log %d to raft %d success nextIdx %+v matchIdx %+v", rf.me, req.Entries[0].LogId, id, rf.nextIndex, rf.matchIndex)
+			}
+		}(rId, cli)
+
+	}
 }
 
 //
@@ -374,6 +515,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	close(rf.appendCh)
 }
 
 func (rf *Raft) killed() bool {
@@ -382,7 +524,7 @@ func (rf *Raft) killed() bool {
 }
 
 func GetTimeOut() int64 {
-	return int64((rand.Intn(150) + 150) % 451)
+	return int64(150 + (rand.Intn(450) % 150))
 }
 func GetTimeNowMs() int64 {
 	return int64(time.Now().UnixNano()) / int64(time.Millisecond)
@@ -409,7 +551,7 @@ func (rf *Raft) ticker() {
 		timeout = rf.electionTimeout
 		curStat := rf.currentStatus
 		rf.mu.Unlock()
-		log.Printf("raft %d status check %v after %v timeout %v \n", rf.me, curStat, curTime-lastTime, timeout)
+		// log.Printf("raft %d status check %v after %v timeout %v \n", rf.me, curStat, curTime-lastTime, timeout)
 		if curStat != LEADER && curTime-lastTime >= timeout {
 			log.Printf("raft %d start election !", rf.me)
 			rf.handelElection()
@@ -417,8 +559,40 @@ func (rf *Raft) ticker() {
 
 	}
 }
-func (rf *Raft) handleFollower() {
+func (rf *Raft) handelCommitLog() {
+	totalPeers := len(rf.peers)
+	majorityNum := totalPeers/2 + ((totalPeers % 2) ^ 1)
+	for rf.killed() == false {
 
+		rf.mu.Lock()
+		newCommitIdx := rf.commitIndex
+		nowCommiteIdx := rf.commitIndex
+		for _, log := range rf.log[rf.commitIndex+1:] {
+			matchCnt := 1
+			for rId := 0; rId < totalPeers; rId++ {
+				if rf.matchIndex[rId] >= int(log.LogId) {
+					matchCnt++
+				}
+			}
+			if matchCnt > majorityNum && log.Term == rf.currentTerm {
+				newCommitIdx = log.LogId
+			}
+		}
+		rf.commitIndex = newCommitIdx
+		rf.mu.Unlock()
+		if newCommitIdx > nowCommiteIdx {
+			needCommitByLeader := rf.log[nowCommiteIdx+1 : newCommitIdx+1]
+			go func(sendLogs []Log) {
+
+				for _, sendLog := range sendLogs {
+					rf.SendLogToApplyCh(&sendLog)
+					log.Printf("logId %d Term %d commited by leader %d\n", sendLog.LogId, sendLog.Term, rf.me)
+				}
+			}(needCommitByLeader)
+
+		}
+		time.Sleep(time.Millisecond * 50)
+	}
 }
 func (rf *Raft) handelLeader() {
 	for rf.killed() == false {
@@ -436,17 +610,21 @@ func (rf *Raft) handelElection() bool {
 	rf.votedFor = rf.me
 	newTerm := rf.currentTerm
 	rf.lastHeartBeatTime = GetTimeNowMs()
+	lastLogIdx := rf.lastAppliedIdx
+	lastLogTerm := rf.log[rf.lastAppliedIdx].Term
 	rf.mu.Unlock()
 	// 2. send vote request
 	var voteCnt int32 = 1
-	for rf_id, cli := range rf.peers {
-		if rf_id == rf.me {
+	for rId, cli := range rf.peers {
+		if rId == rf.me {
 			continue
 		}
 		req := &RequestVoteArgs{}
 		resp := &RequestVoteReply{}
 		req.Term = newTerm
 		req.CandidateId = rf.me
+		req.LastLogIndex = lastLogIdx
+		req.LastLogTerm = int32(lastLogTerm)
 
 		go func(curCli *labrpc.ClientEnd, id int) {
 			curCli.Call("Raft.RequestVote", req, resp)
@@ -457,7 +635,7 @@ func (rf *Raft) handelElection() bool {
 				atomic.AddInt32(&voteCnt, int32(1))
 
 			}
-		}(cli, rf_id)
+		}(cli, rId)
 	}
 	total_peers := len(rf.peers)
 	//3. cnt vote
@@ -481,13 +659,21 @@ func (rf *Raft) handelElection() bool {
 			log.Printf("raft %d win election term %d", rf.me, rf.currentTerm)
 			rf.mu.Lock()
 			rf.currentStatus = LEADER
+			for i := range rf.nextIndex {
+				rf.nextIndex[i] = int(rf.lastAppliedIdx) + 1
+				rf.matchIndex[i] = 0
+			}
 			rf.mu.Unlock()
+			go rf.sendHeatBeat()
 			return true
 		} else if nowTime-rf.lastHeartBeatTime >= rf.electionTimeout {
 			log.Printf("raft %d with term %d election timeout %d", rf.me, rf.currentTerm, rf.electionTimeout)
 			//reset
 			rf.mu.Lock()
 			rf.votedFor = -1
+			rf.currentTerm -= 1
+			rf.currentStatus = FOLLOWER
+			rf.electionTimeout = GetTimeOut()
 			rf.mu.Unlock()
 			return false
 		}
@@ -520,6 +706,16 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.votedFor = -1
 	rf.currentTerm = 0
 
+	rf.appendCh = make(chan *Log)
+	rf.applyCh = applyCh
+
+	rf.lastAppliedIdx = 0
+	rf.commitIndex = 0
+	rf.matchIndex = make([]int, len(rf.peers))
+	rf.nextIndex = make([]int, len(rf.peers))
+
+	rf.log = append(make([]Log, 0), Log{})
+
 	// Your initialization code here (2A, 2B, 2C).
 
 	// initialize from state persisted before a crash
@@ -527,7 +723,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start ticker goroutine to start elections
 	go rf.ticker()
+
+	//start ticker to handel leader hearts beat
 	go rf.handelLeader()
-	log.Printf("raft inst created: id : %d, init timeout : %d\n", rf.me, rf.electionTimeout)
+
+	//start ticker to handel commit log
+	go rf.handelCommitLog()
+	log.Printf("raft inst created: %+v\n", rf)
 	return rf
 }
